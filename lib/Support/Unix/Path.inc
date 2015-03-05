@@ -544,6 +544,9 @@ error_code setLastModificationAndAccessTime(int FD, TimeValue Time) {
 #elif defined(__native_client__)
   if (true)
   // @LOCALMOD-END
+#elif defined(__EMSCRIPTEN__)
+  if (true)
+  // @LOCALMOD-END
 #else
 #error Missing futimes() and futimens()
 #endif
