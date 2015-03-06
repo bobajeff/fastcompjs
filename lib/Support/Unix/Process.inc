@@ -343,6 +343,10 @@ const char *Process::ResetColor() {
   return "\033[0m";
 }
 
+#if defined(__EMSCRIPTEN__)
+#undef HAVE_ARC4RANDOM
+#endif
+
 #if !defined(HAVE_ARC4RANDOM)
 static unsigned GetRandomNumberSeed() {
   // Attempt to get the initial seed from /dev/urandom, if possible.

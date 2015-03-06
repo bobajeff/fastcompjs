@@ -188,6 +188,9 @@ INSTANTIATE_TYPED_TEST_CASE_P(My, FooTest, MyTypes);
 #endif  // GTEST_HAS_TYPED_TEST
 
 // Implements type-parameterized tests.
+#if defined(__EMSCRIPTEN__)
+#undef GTEST_HAS_TYPED_TEST_P
+#endif
 
 #if GTEST_HAS_TYPED_TEST_P
 
