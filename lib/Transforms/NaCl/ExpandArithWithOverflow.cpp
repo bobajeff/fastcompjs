@@ -64,6 +64,14 @@ static uint64_t UintTypeMax(unsigned Bits) {
   return (((uint64_t) 1) << Bits) - 1;
 }
 
+static int64_t SintTypeMax(unsigned Bits) {
+  return (((int64_t) 1) << (Bits-1)) - 1;
+}
+
+static int64_t SintTypeMin(unsigned Bits) {
+  return -(((int64_t) 1) << (Bits-1));
+}
+
 static Value *CreateInsertValue(Value *StructVal, unsigned Index,
                                 Value *Field, Instruction *BasedOn) {
   SmallVector<unsigned, 1> EVIndexes;
@@ -73,24 +81,34 @@ static Value *CreateInsertValue(Value *StructVal, unsigned Index,
                        BasedOn->getName() + ".insert", BasedOn), BasedOn);
 }
 
-static bool ExpandOpForIntSize(Module *M, unsigned Bits, bool Mul) {
+static bool ExpandOpForIntSize(Module *M, unsigned Bits, bool Mul, bool Signed, bool Sub) { // XXX EMSCRIPTEN: Signed, Sub are horribly hackish
   IntegerType *IntTy = IntegerType::get(M->getContext(), Bits);
   SmallVector<Type *, 1> Types;
   Types.push_back(IntTy);
-  Intrinsic::ID ID = (Mul ? Intrinsic::umul_with_overflow
-                          : Intrinsic::uadd_with_overflow);
+  Intrinsic::ID ID;
+  if (!Signed) {
+    ID = (Mul ? Intrinsic::umul_with_overflow
+              : Intrinsic::uadd_with_overflow);
+  } else {
+    ID = (Mul ? Intrinsic::smul_with_overflow
+              : (Sub ? Intrinsic::ssub_with_overflow : Intrinsic::sadd_with_overflow));
+  }
   std::string Name = Intrinsic::getName(ID, Types);
   Function *Intrinsic = M->getFunction(Name);
   if (!Intrinsic)
     return false;
-  for (Value::use_iterator CallIter = Intrinsic->use_begin(),
-         E = Intrinsic->use_end(); CallIter != E; ) {
-    CallInst *Call = dyn_cast<CallInst>(*CallIter++);
-    if (!Call) {
+
+  SmallVector<CallInst *, 64> Calls;
+  for (User *U : Intrinsic->users()) {
+    if (CallInst *Call = dyn_cast<CallInst>(U))
+      Calls.push_back(Call);
+    else
       report_fatal_error("ExpandArithWithOverflow: Taking the address of a "
                          "*.with.overflow intrinsic is not allowed");
-    }
-    Value *VariableArg, *VariableArg2 = NULL;
+  }
+
+  for (CallInst *Call : Calls) {
+    Value *VariableArg, *VariableArg2 = nullptr;
     ConstantInt *ConstantArg;
     if (ConstantInt *C = dyn_cast<ConstantInt>(Call->getArgOperand(0))) {
       VariableArg = Call->getArgOperand(1);
@@ -110,7 +128,7 @@ static bool ExpandOpForIntSize(Module *M, unsigned Bits, bool Mul) {
 
     Value *ArithResult, *OverflowResult;
 
-    if (!VariableArg2) {
+    if (!VariableArg2 && !Signed && !Sub) {
       ArithResult = BinaryOperator::Create(
           (Mul ? Instruction::Mul : Instruction::Add), VariableArg, ConstantArg,
           Call->getName() + ".arith", Call);
@@ -126,13 +144,43 @@ static bool ExpandOpForIntSize(Module *M, unsigned Bits, bool Mul) {
           Call->getName() + ".overflow");
     } else {
       // XXX EMSCRIPTEN: generalize this to nonconstant values, easy for addition
-      ArithResult = BinaryOperator::Create(Instruction::Add,
+      //                 also for signed values
+      assert(!Mul);
+      // order of these matters, in sub
+      VariableArg  = Call->getArgOperand(0);
+      VariableArg2 = Call->getArgOperand(1);
+      ArithResult = BinaryOperator::Create(Sub ? Instruction::Sub : Instruction::Add,
           VariableArg, VariableArg2,
           Call->getName() + ".arith", Call);
-      // If x+y < x (or y), unsigned 32 addition, then an overflow occurred
-      OverflowResult = new ICmpInst(
-          Call, CmpInst::ICMP_ULT, ArithResult, VariableArg,
-          Call->getName() + ".overflow");
+      if (!Signed) {
+        assert(!Sub);
+        // If x+y < x (or y), unsigned 32 addition, then an overflow occurred
+        OverflowResult = new ICmpInst(
+            Call, CmpInst::ICMP_ULT, ArithResult, VariableArg,
+            Call->getName() + ".overflow");
+      } else {
+        // In the signed case, we care if the sum is >127 or <-128. When looked at
+        // as an unsigned number, that is precisely when the sum is >= 128
+        Value *PositiveTemp = BinaryOperator::Create(Instruction::Add,
+            VariableArg, ConstantInt::get(IntTy, SintTypeMin(Bits) + (Sub ? 1 : 0)),
+            Call->getName() + ".postemp", Call);
+        Value *NegativeTemp = BinaryOperator::Create(Instruction::Add,
+            VariableArg, ConstantInt::get(IntTy, SintTypeMax(Bits) + (Sub ? 1 : 0)),
+            Call->getName() + ".negtemp", Call);
+        Value *PositiveCheck = new ICmpInst(
+            Call, CmpInst::ICMP_SLT, ArithResult, PositiveTemp,
+            Call->getName() + ".poscheck");
+        Value *NegativeCheck = new ICmpInst(
+            Call, CmpInst::ICMP_SGT, ArithResult, NegativeTemp,
+            Call->getName() + ".negcheck");
+        Value *IsPositive = new ICmpInst(
+            Call, CmpInst::ICMP_SGE, VariableArg, ConstantInt::get(IntTy, 0),
+            Call->getName() + ".ispos");
+        OverflowResult = SelectInst::Create(
+            IsPositive, PositiveCheck, NegativeCheck,
+            Call->getName() + ".select",
+            Call);
+      }
     }
 
     // Construct the struct result.
@@ -142,14 +190,17 @@ static bool ExpandOpForIntSize(Module *M, unsigned Bits, bool Mul) {
     Call->replaceAllUsesWith(NewStruct);
     Call->eraseFromParent();
   }
+
   Intrinsic->eraseFromParent();
   return true;
 }
 
 static bool ExpandForIntSize(Module *M, unsigned Bits) {
   bool Modified = false;
-  Modified |= ExpandOpForIntSize(M, Bits, true); // Expand umul
-  Modified |= ExpandOpForIntSize(M, Bits, false); // Expand uadd
+  Modified |= ExpandOpForIntSize(M, Bits, true,  false, false); // Expand umul
+  Modified |= ExpandOpForIntSize(M, Bits, false, false, false); // Expand uadd
+  Modified |= ExpandOpForIntSize(M, Bits, false, true,  false); // Expand sadd (for ubsan) XXX EMSCRIPTEN
+  Modified |= ExpandOpForIntSize(M, Bits, false, true,  true);  // Expand sadd (for ubsan) XXX EMSCRIPTEN
   return Modified;
 }
 
